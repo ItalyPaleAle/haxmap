@@ -165,7 +165,10 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	// Actually perform the swap, replacing elems with a "clean" slice
 	// Then, return the slice with the items that are to be removed from the haxmap
 	curElems := b.elems
-	b.elems = b.sp.Get(int(curCount))
+	desiredCap := int(((curCount / b.minSize) + 1) * b.minSize) // Round up to multiples of minSize
+	b.elems = b.sp.Get(int(desiredCap))
+	// Set length equal to capacity
+	b.elems = b.elems[0:cap(b.elems)]
 	b.cap.Store(int32(len(b.elems)))
 	return curElems[0:curCount]
 }
