@@ -182,6 +182,39 @@ func TestDelete2(t *testing.T) {
 	})
 }
 
+func TestDelElement(t *testing.T) {
+	m := New[int, int]()
+	els := [3]*element[int, int]{
+		m.Set(0, 0),
+		m.Set(1, 1),
+		m.Set(2, 2),
+	}
+	if l := m.Len(); l != 3 {
+		t.Fatalf("Length should have been 3, but was %d", l)
+	}
+
+	m.DelElement(els[0])
+	if l := m.Len(); l != 2 {
+		t.Fatalf("Length should have been 2, but was %d", l)
+	}
+	if _, ok := m.Get(0); ok {
+		t.Fatalf("Element 0 should have been deleted")
+	}
+
+	m.DelElement(els[2])
+	if l := m.Len(); l != 1 {
+		t.Fatalf("Length should have been 1, but was %d", l)
+	}
+	if _, ok := m.Get(2); ok {
+		t.Fatalf("Element 2 should have been deleted")
+	}
+
+	m.DelElement(els[1])
+	if l := m.Len(); l != 0 {
+		t.Fatalf("Length should have been 0, but was %d", l)
+	}
+}
+
 // from https://pkg.go.dev/sync#Map.LoadOrStore
 func TestGetOrSet(t *testing.T) {
 	var (

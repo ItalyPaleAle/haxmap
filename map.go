@@ -90,9 +90,7 @@ func (m *Map[K, V]) Del(keys ...K) {
 		}
 		for ; existing != nil && existing.keyHash <= h; existing = existing.next() {
 			if existing.key == keys[0] {
-				if existing.remove() { // mark node for lazy removal on next pass
-					m.removeItemFromIndex(existing) // remove node from map index
-				}
+				m.DelElement(existing)
 				return
 			}
 		}
@@ -118,9 +116,7 @@ func (m *Map[K, V]) Del(keys ...K) {
 
 		for elem != nil && iter < size {
 			if elem.keyHash == delQ[iter].keyHash && elem.key == delQ[iter].key {
-				if elem.remove() { // mark node for lazy removal on next pass
-					m.removeItemFromIndex(elem) // remove node from map index
-				}
+				m.DelElement(elem)
 				iter++
 				elem = elem.next()
 			} else if elem.keyHash > delQ[iter].keyHash {
@@ -129,6 +125,13 @@ func (m *Map[K, V]) Del(keys ...K) {
 				elem = elem.next()
 			}
 		}
+	}
+}
+
+// DelElement deletes an element from the map
+func (m *Map[K, V]) DelElement(elem *element[K, V]) {
+	if elem.remove() { // mark node for lazy removal on next pass
+		m.removeItemFromIndex(elem) // remove node from map index
 	}
 }
 
@@ -150,7 +153,7 @@ func (m *Map[K, V]) Get(key K) (value V, ok bool) {
 // Set tries to update an element if key is present else it inserts a new element
 // If a resizing operation is happening concurrently while calling Set()
 // then the item might show up in the map only after the resize operation is finished
-func (m *Map[K, V]) Set(key K, value V) {
+func (m *Map[K, V]) Set(key K, value V) *element[K, V] {
 	var (
 		h        = m.hasher(key)
 		valPtr   = &value
@@ -179,6 +182,8 @@ func (m *Map[K, V]) Set(key K, value V) {
 	if resizeNeeded(uintptr(len(data.index)), count) && m.resizing.CompareAndSwap(notResizing, resizingInProgress) {
 		m.grow(0) // double in size
 	}
+
+	return alloc
 }
 
 // GetOrSet returns the existing value for the key if present
