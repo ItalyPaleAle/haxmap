@@ -51,8 +51,9 @@ func TestCache(t *testing.T) {
 		require.Truef(t, found[1] == (found[0]+1)%cacheCount, "Buckets do not follow each-other: %v", found)
 	})
 
+	ttl1Idx := -1
 	t.Run("verify grows", func(t *testing.T) {
-		for i := 3; i < 3*bucketSize; i++ {
+		for i := 3; i < (3*bucketSize + 2); i++ {
 			cache.Set(fmt.Sprintf("key%d", i), fmt.Sprintf("val%d", i), 1)
 		}
 
@@ -62,6 +63,9 @@ func TestCache(t *testing.T) {
 			l := len(cache.s[i].elems)
 			require.Equalf(t, c, l, "Slice %d has cap %d and len(elems) %d", i, c, l)
 			caps[c]++
+			if c > bucketSize {
+				ttl1Idx = i
+			}
 		}
 
 		expect := map[int]int{
@@ -70,9 +74,14 @@ func TestCache(t *testing.T) {
 		}
 		require.Len(t, caps, 2)
 		require.Equal(t, expect, caps)
+		require.GreaterOrEqual(t, ttl1Idx, 0)
 	})
 
 	t.Run("do not return expired entries", func(t *testing.T) {
+		if ttl1Idx == -1 {
+			t.Fatalf("test 'verify grows' must be executed first")
+		}
+
 		clock.Step(time.Second)
 
 		// key1 had TTL 3s
@@ -83,5 +92,9 @@ func TestCache(t *testing.T) {
 		// key3 had TTL 1s
 		_, ok = cache.Get("key3")
 		require.False(t, ok)
+
+		// Slice is still there since no set operation happened
+		require.EqualValues(t, (bucketSize*3)-1, cache.s[ttl1Idx].num.Load())
+		require.LessOrEqual(t, cache.s[ttl1Idx].exp.Load(), clock.Now().Unix())
 	})
 }

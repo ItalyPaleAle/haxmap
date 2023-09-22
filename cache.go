@@ -60,7 +60,7 @@ func (c *Cache[V]) Set(key string, val V, ttl int64) {
 	idx := (nowUnix + ttl) % c.cap
 
 	// Reset the bucket if it has expired
-	swapped := c.s[idx].resetIfNeeded(nowUnix, c.cap)
+	swapped := c.s[idx].resetIfNeeded(nowUnix, ttl)
 
 	// Add to the bucket
 	c.s[idx].add(uintptr(unsafe.Pointer(el)))
@@ -73,7 +73,7 @@ func (c *Cache[V]) Set(key string, val V, ttl int64) {
 
 func (c *Cache[V]) Get(key string) (v V, ok bool) {
 	val, ok := c.m.Get(key)
-	if !ok || val.exp.Before(c.clock.Now()) {
+	if !ok || !val.exp.After(c.clock.Now()) {
 		return v, false
 	}
 	return val.val, true
