@@ -39,6 +39,8 @@ func TestCache(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, v, "val2")
 
+	require.Equal(t, 2, int(cache.m.Len()))
+
 	t.Run("verify bucket.num", func(t *testing.T) {
 		var num int
 		found := []int{}
@@ -69,6 +71,8 @@ func TestCache(t *testing.T) {
 			}
 		}
 
+		require.Equal(t, (3*bucketSize + 1), int(cache.m.Len()))
+
 		expect := map[int]int{
 			bucketSize:     (cacheCount - 1),
 			bucketSize * 3: 1,
@@ -97,6 +101,9 @@ func TestCache(t *testing.T) {
 		// Slice is still there since no set operation happened
 		require.EqualValues(t, (bucketSize*3)-1, cache.s[ttl1Idx].num.Load())
 		require.LessOrEqual(t, cache.s[ttl1Idx].exp.Load(), clock.Now().Unix())
+
+		// Stale data is still in the map too
+		require.Equal(t, (3*bucketSize + 1), int(cache.m.Len()))
 	})
 
 	t.Run("cleanup expired entries", func(t *testing.T) {
@@ -121,6 +128,10 @@ func TestCache(t *testing.T) {
 		require.Equal(t, beforeExp+cacheCount, afterExp)
 		require.Equal(t, int32(1), afterNum)
 		require.Equal(t, beforeLen, afterLen)
+
+		require.Eventuallyf(t, func() bool {
+			return cache.m.Len() == 3
+		}, time.Second, 10*time.Millisecond, "expired records are never removed from the map; current count is %d", cache.m.Len())
 	})
 }
 
@@ -171,7 +182,7 @@ func TestCacheSetConcurrencyWithTimeAdvancing(t *testing.T) {
 	const (
 		cacheCount = 5
 		bucketSize = 8
-		iter       = 30
+		iter       = 300
 	)
 
 	clock := &clocktesting.FakeClock{}
@@ -203,7 +214,7 @@ func TestCacheSetConcurrencyWithTimeAdvancing(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	setFn(iter/3*2+1, iter)
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(time.Second)
 
 	// Check that all values are set
 	for i := 1; i < cacheCount; i++ {
