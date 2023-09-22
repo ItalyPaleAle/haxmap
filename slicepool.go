@@ -12,8 +12,12 @@ License (Apache2): https://github.com/xdg-go/zzz-slice-recycling/blob/master/LIC
 
 // SlicePool is a wrapper around sync.Pool to get a slice with a given capacity.
 type SlicePool[T any] struct {
+	// Minimum capacity of slices returned by the pool.
 	MinCap int
-	pool   *sync.Pool
+	// If true, slices are not zero'd before they are returned.
+	// This means that slices could contain old data.
+	NoReset bool
+	pool    *sync.Pool
 }
 
 // NewSlicePool returns a new SlicePool object.
@@ -35,9 +39,13 @@ func (sp SlicePool[T]) Get(cap int) []T {
 		return make([]T, 0, cap)
 	}
 	buf := bp.([]T)
-	var zero T
-	for i := range buf {
-		buf[i] = zero
+
+	// Reset the contents of the slice if needed
+	if !sp.NoReset {
+		var zero T
+		for i := range buf {
+			buf[i] = zero
+		}
 	}
 	return buf[0:0]
 }

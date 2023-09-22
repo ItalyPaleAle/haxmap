@@ -16,11 +16,9 @@ import (
 
 const defaultMinBucketSize = 20
 
-type cacheEntry[V any] struct {
-	val V
-	exp time.Time
-}
-
+// Cache implements a cache for short-lived objects, up to `cap` seconds (for example, 5 seconds).
+// Objects are stored in a haxmap maintained internally where they can be looked up efficiently.
+// Additionally, a reference to the elements is stored in a slice, one per each TTL, which allows purging entries from the cache efficiently.
 type Cache[V any] struct {
 	m     *Map[string, cacheEntry[V]]
 	s     []cacheBucket
@@ -29,6 +27,8 @@ type Cache[V any] struct {
 	clock kclock.Clock
 }
 
+// NewCache creates a new Cache with the given capacity.
+// The capacity corresponds to the maximum TTL for items in the cache.
 func NewCache[V any](cap int64) *Cache[V] {
 	return newCacheWithClock[V](cap, kclock.RealClock{}, defaultMinBucketSize)
 }
@@ -38,6 +38,7 @@ func newCacheWithClock[V any](cap int64, clock kclock.Clock, minBucketSize int) 
 		panic("invalid minBucketSize")
 	}
 	sp := NewSlicePool[uintptr](minBucketSize)
+	sp.NoReset = true
 	return &Cache[V]{
 		m:     New[string, cacheEntry[V]](),
 		cap:   cap,
@@ -47,6 +48,8 @@ func newCacheWithClock[V any](cap int64, clock kclock.Clock, minBucketSize int) 
 	}
 }
 
+// Set an item in the cache.
+// The TTL must not be larger than the capacity of the Cache.
 func (c *Cache[V]) Set(key string, val V, ttl int64) {
 	if ttl <= 0 {
 		panic("invalid TTL: must be > 0")
@@ -75,6 +78,8 @@ func (c *Cache[V]) Set(key string, val V, ttl int64) {
 	}
 }
 
+// Get returns an item from the cache.
+// Items that have expired are not returned.
 func (c *Cache[V]) Get(key string) (v V, ok bool) {
 	val, ok := c.m.Get(key)
 	if !ok || !val.exp.After(c.clock.Now()) {
@@ -86,6 +91,7 @@ func (c *Cache[V]) Get(key string) (v V, ok bool) {
 func (c *Cache[V]) removeSwapped(swapped []uintptr) {
 	// Remove all elements from the map
 	for i := 0; i < len(swapped); i++ {
+		// govet doesn't like the line below, but it's a false positive in our case
 		el := (*element[string, cacheEntry[V]])(unsafe.Pointer(swapped[i]))
 		c.m.DelElement(el)
 	}
@@ -94,11 +100,18 @@ func (c *Cache[V]) removeSwapped(swapped []uintptr) {
 	c.sp.Put(swapped)
 }
 
+// Each item in the cache is stored in a cacheEntry, which includes the value as well as its expiration time.
+type cacheEntry[V any] struct {
+	val V
+	exp time.Time
+}
+
 // This structs is used to reference objects stored in each "bucket" in the cache, one per each expiration second.
 type cacheBucket struct {
 	// In here, we use a bit of "dark arts" to optimize how the GC handles this.
 	// Inside "elems", we maintain a pointer to one of the elements stored in the haxmap.
 	// Rather than using `[]*element`, which is a slice of actual pointers, we convert pointers to `uintptr` and store them in the slice. This is easier on the GC because slices of pointers cause the GC to scan each item, but slices of scalar types (`uintptr` is essentially an integer) are ignored.
+	// We can do this safely because there's a "strong reference" to the `element` object stored in the haxmap, so there's no risk to having this "weak reference", as the GC won't remove the object as long as it's in the haxmap.
 	// This is fine as long as the Go compiler doesn't move objects that are stored on the heap, changing their address. This is true as of writing and it's guaranteed by the blank import of "assume-no-moving-gc". Should that change in the future, and this package fail to build, we can update the code to use a slice of `[]*element` instead.
 	elems   []uintptr
 	cap     atomic.Int32
@@ -123,10 +136,12 @@ func newCacheBucketSlice(count int64, sp *SlicePool[uintptr], minBucketSize int)
 	return res
 }
 
+// Resets the bucket if it's expired.
+// A bucket is expired when its "exp" is in the past.
 func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
+	// Check if the bucket is expired; if not, return right away.
 	curExp := b.exp.Load()
 	if curExp > now {
-		// Not expired
 		return nil
 	}
 
@@ -134,7 +149,8 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Update the exp value, with a CAS to check again after we acquired the lock
+	// Update the exp value
+	// We use a CAS here because if another goroutine acquired the lock before us, it may have performed the reset already.
 	if !b.exp.CompareAndSwap(curExp, now+ttl) {
 		return nil
 	}
@@ -146,6 +162,8 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 		return nil
 	}
 
+	// Actually perform the swap, replacing elems with a "clean" slice
+	// Then, return the slice with the items that are to be removed from the haxmap
 	curElems := b.elems
 	b.elems = b.sp.Get(int(curCount))
 	b.cap.Store(int32(len(b.elems)))
@@ -162,6 +180,8 @@ func (b *cacheBucket) add(el uintptr) {
 	b.elems[pos-1] = el
 }
 
+// Used internally to expand the capacity of the elems slice if needed.
+// If the slice needs to be expanded, the bucket is locked temporarily to protect the integrity.
 func (b *cacheBucket) expandIfNeeded(req int32) {
 	// If we have enough capacity, nothing to do
 	if req <= b.cap.Load() {
