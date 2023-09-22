@@ -5,11 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
-
-	// Blank import for "assume-no-moving-gc" which makes the program crash if it's compiled with a Go compiler that has a GC that moves objects currently on the heap.
-	// Read more below on why this is needed.
-	_ "go4.org/unsafe/assume-no-moving-gc"
 
 	kclock "k8s.io/utils/clock"
 )
@@ -21,9 +16,9 @@ const defaultMinBucketSize = 20
 // Additionally, a reference to the elements is stored in a slice, one per each TTL, which allows purging entries from the cache efficiently.
 type Cache[V any] struct {
 	m     *Map[string, cacheEntry[V]]
-	s     []cacheBucket
+	s     []cacheBucket[V]
 	cap   int64
-	sp    *SlicePool[uintptr]
+	sp    *SlicePool[*element[string, cacheEntry[V]]]
 	clock kclock.Clock
 }
 
@@ -37,12 +32,12 @@ func newCacheWithClock[V any](cap int64, clock kclock.Clock, minBucketSize int) 
 	if minBucketSize < 0 || minBucketSize > (2<<32-1) {
 		panic("invalid minBucketSize")
 	}
-	sp := NewSlicePool[uintptr](minBucketSize)
+	sp := NewSlicePool[*element[string, cacheEntry[V]]](minBucketSize)
 	sp.NoReset = true
 	return &Cache[V]{
 		m:     New[string, cacheEntry[V]](),
 		cap:   cap,
-		s:     newCacheBucketSlice(cap, sp, minBucketSize),
+		s:     newCacheBucketSlice[V](cap, sp, minBucketSize),
 		sp:    sp,
 		clock: clock,
 	}
@@ -70,7 +65,7 @@ func (c *Cache[V]) Set(key string, val V, ttl int64) {
 	swapped := c.s[idx].resetIfNeeded(nowUnix, ttl)
 
 	// Add to the bucket
-	c.s[idx].add(uintptr(unsafe.Pointer(el)))
+	c.s[idx].add(el)
 
 	// If we have items swapped out, we need to delete them in background
 	if len(swapped) > 0 {
@@ -88,12 +83,10 @@ func (c *Cache[V]) Get(key string) (v V, ok bool) {
 	return val.val, true
 }
 
-func (c *Cache[V]) removeSwapped(swapped []uintptr) {
+func (c *Cache[V]) removeSwapped(swapped []*element[string, cacheEntry[V]]) {
 	// Remove all elements from the map
 	for i := 0; i < len(swapped); i++ {
-		// govet doesn't like the line below, but it's a false positive in our case
-		el := (*element[string, cacheEntry[V]])(unsafe.Pointer(swapped[i]))
-		c.m.DelElement(el)
+		c.m.DelElement(swapped[i])
 	}
 
 	// Put the slice back in the pool
@@ -107,29 +100,26 @@ type cacheEntry[V any] struct {
 }
 
 // This structs is used to reference objects stored in each "bucket" in the cache, one per each expiration second.
-type cacheBucket struct {
-	// In here, we use a bit of "dark arts" to optimize how the GC handles this.
-	// Inside "elems", we maintain a pointer to one of the elements stored in the haxmap.
-	// Rather than using `[]*element`, which is a slice of actual pointers, we convert pointers to `uintptr` and store them in the slice. This is easier on the GC because slices of pointers cause the GC to scan each item, but slices of scalar types (`uintptr` is essentially an integer) are ignored.
-	// We can do this safely because there's a "strong reference" to the `element` object stored in the haxmap, so there's no risk to having this "weak reference", as the GC won't remove the object as long as it's in the haxmap.
-	// This is fine as long as the Go compiler doesn't move objects that are stored on the heap, changing their address. This is true as of writing and it's guaranteed by the blank import of "assume-no-moving-gc". Should that change in the future, and this package fail to build, we can update the code to use a slice of `[]*element` instead.
-	elems   []uintptr
-	cap     atomic.Int32
-	num     atomic.Int32
-	exp     atomic.Int64
-	mu      sync.Mutex
-	sp      *SlicePool[uintptr]
-	minSize int32
+type cacheBucket[V any] struct {
+	elems       []*element[string, cacheEntry[V]]
+	cap         atomic.Int32
+	num         atomic.Int32
+	exp         atomic.Int64
+	mu          sync.RWMutex
+	sp          *SlicePool[*element[string, cacheEntry[V]]]
+	minSize     int32
+	expandingCh chan struct{}
 }
 
-func newCacheBucketSlice(count int64, sp *SlicePool[uintptr], minBucketSize int) []cacheBucket {
+func newCacheBucketSlice[V any](count int64, sp *SlicePool[*element[string, cacheEntry[V]]], minBucketSize int) []cacheBucket[V] {
 	mbs := int32(minBucketSize)
-	res := make([]cacheBucket, count)
+	res := make([]cacheBucket[V], count)
 	for i := int64(0); i < count; i++ {
-		res[i] = cacheBucket{
-			elems:   make([]uintptr, minBucketSize),
-			sp:      sp,
-			minSize: mbs,
+		res[i] = cacheBucket[V]{
+			elems:       make([]*element[string, cacheEntry[V]], minBucketSize),
+			sp:          sp,
+			minSize:     mbs,
+			expandingCh: make(chan struct{}, 1),
 		}
 		res[i].cap.Store(mbs)
 	}
@@ -138,7 +128,7 @@ func newCacheBucketSlice(count int64, sp *SlicePool[uintptr], minBucketSize int)
 
 // Resets the bucket if it's expired.
 // A bucket is expired when its "exp" is in the past.
-func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
+func (b *cacheBucket[V]) resetIfNeeded(now int64, ttl int64) (swapped []*element[string, cacheEntry[V]]) {
 	// Check if the bucket is expired; if not, return right away.
 	curExp := b.exp.Load()
 	if curExp > now {
@@ -149,9 +139,8 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Update the exp value
-	// We use a CAS here because if another goroutine acquired the lock before us, it may have performed the reset already.
-	if !b.exp.CompareAndSwap(curExp, now+ttl) {
+	// Check the value again in case another goroutine got the lock before us
+	if curExp != b.exp.Load() {
 		return nil
 	}
 
@@ -159,6 +148,8 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	curCount := b.num.Swap(0)
 	if curCount == 0 && b.cap.Load() >= b.minSize {
 		// If there was nothing in the slice already, and the slice didn't have size 0, we don't need to reset it
+		// Just set the updated exp value
+		b.exp.Store(now + ttl)
 		return nil
 	}
 
@@ -170,22 +161,29 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	// Set length equal to capacity
 	b.elems = b.elems[0:cap(b.elems)]
 	b.cap.Store(int32(len(b.elems)))
+
+	// Update the exp value
+	b.exp.Store(now + ttl)
+
 	return curElems[0:curCount]
 }
 
-func (b *cacheBucket) add(el uintptr) {
+func (b *cacheBucket[V]) add(el *element[string, cacheEntry[V]]) {
 	pos := b.num.Add(1)
 
 	// Check if we need to expand
 	b.expandIfNeeded(pos)
 
 	// Store
+	// Use a RLock because we just need to make sure no one else is expanding the slice
+	b.mu.RLock()
 	b.elems[pos-1] = el
+	b.mu.RUnlock()
 }
 
 // Used internally to expand the capacity of the elems slice if needed.
 // If the slice needs to be expanded, the bucket is locked temporarily to protect the integrity.
-func (b *cacheBucket) expandIfNeeded(req int32) {
+func (b *cacheBucket[V]) expandIfNeeded(req int32) {
 	// If we have enough capacity, nothing to do
 	if req <= b.cap.Load() {
 		return
