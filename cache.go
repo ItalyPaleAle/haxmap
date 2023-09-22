@@ -7,6 +7,10 @@ import (
 	"time"
 	"unsafe"
 
+	// Blank import for "assume-no-moving-gc" which makes the program crash if it's compiled with a Go compiler that has a GC that moves objects currently on the heap.
+	// Read more below on why this is needed.
+	_ "go4.org/unsafe/assume-no-moving-gc"
+
 	kclock "k8s.io/utils/clock"
 )
 
@@ -90,7 +94,12 @@ func (c *Cache[V]) removeSwapped(swapped []uintptr) {
 	c.sp.Put(swapped)
 }
 
+// This structs is used to reference objects stored in each "bucket" in the cache, one per each expiration second.
 type cacheBucket struct {
+	// In here, we use a bit of "dark arts" to optimize how the GC handles this.
+	// Inside "elems", we maintain a pointer to one of the elements stored in the haxmap.
+	// Rather than using `[]*element`, which is a slice of actual pointers, we convert pointers to `uintptr` and store them in the slice. This is easier on the GC because slices of pointers cause the GC to scan each item, but slices of scalar types (`uintptr` is essentially an integer) are ignored.
+	// This is fine as long as the Go compiler doesn't move objects that are stored on the heap, changing their address. This is true as of writing and it's guaranteed by the blank import of "assume-no-moving-gc". Should that change in the future, and this package fail to build, we can update the code to use a slice of `[]*element` instead.
 	elems   []uintptr
 	cap     atomic.Int32
 	num     atomic.Int32
