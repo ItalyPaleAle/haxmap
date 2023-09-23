@@ -91,8 +91,13 @@ func (c *Cache[V]) Get(key string) (v V, ok bool) {
 func (c *Cache[V]) removeSwapped(swapped []uintptr) {
 	// Remove all elements from the map
 	for i := 0; i < len(swapped); i++ {
-		// govet doesn't like the line below, but it's a false positive in our case
-		el := (*element[string, cacheEntry[V]])(unsafe.Pointer(swapped[i]))
+		// This awkward conversion is necessary because otherwise govet doesn't like
+		//    el := (*element[string, cacheEntry[V]])(unsafe.Pointer(swapped[i]))
+		// Yes, this conversion is dangerous, but we know that the uintptr is pointing to a valid object that Go manages
+		// We also know the object hasn't been GC'd yet
+		// Source for the workaround: https://github.com/golang/go/issues/58625#issue-1594113485
+		p := *(*unsafe.Pointer)(unsafe.Pointer(&swapped[i]))
+		el := (*element[string, cacheEntry[V]])(p)
 		c.m.DelElement(el)
 	}
 
@@ -113,13 +118,14 @@ type cacheBucket struct {
 	// Rather than using `[]*element`, which is a slice of actual pointers, we convert pointers to `uintptr` and store them in the slice. This is easier on the GC because slices of pointers cause the GC to scan each item, but slices of scalar types (`uintptr` is essentially an integer) are ignored.
 	// We can do this safely because there's a "strong reference" to the `element` object stored in the haxmap, so there's no risk to having this "weak reference", as the GC won't remove the object as long as it's in the haxmap.
 	// This is fine as long as the Go compiler doesn't move objects that are stored on the heap, changing their address. This is true as of writing and it's guaranteed by the blank import of "assume-no-moving-gc". Should that change in the future, and this package fail to build, we can update the code to use a slice of `[]*element` instead.
-	elems   []uintptr
-	cap     atomic.Int32
-	num     atomic.Int32
-	exp     atomic.Int64
-	mu      sync.Mutex
-	sp      *SlicePool[uintptr]
-	minSize int32
+	elems       []uintptr
+	cap         atomic.Int32
+	num         atomic.Int32
+	exp         atomic.Int64
+	mu          sync.RWMutex
+	sp          *SlicePool[uintptr]
+	minSize     int32
+	expandingCh chan struct{}
 }
 
 func newCacheBucketSlice(count int64, sp *SlicePool[uintptr], minBucketSize int) []cacheBucket {
@@ -127,9 +133,10 @@ func newCacheBucketSlice(count int64, sp *SlicePool[uintptr], minBucketSize int)
 	res := make([]cacheBucket, count)
 	for i := int64(0); i < count; i++ {
 		res[i] = cacheBucket{
-			elems:   make([]uintptr, minBucketSize),
-			sp:      sp,
-			minSize: mbs,
+			elems:       make([]uintptr, minBucketSize),
+			sp:          sp,
+			minSize:     mbs,
+			expandingCh: make(chan struct{}, 1),
 		}
 		res[i].cap.Store(mbs)
 	}
@@ -149,9 +156,8 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Update the exp value
-	// We use a CAS here because if another goroutine acquired the lock before us, it may have performed the reset already.
-	if !b.exp.CompareAndSwap(curExp, now+ttl) {
+	// Check the value again in case another goroutine got the lock before us
+	if curExp != b.exp.Load() {
 		return nil
 	}
 
@@ -159,6 +165,8 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	curCount := b.num.Swap(0)
 	if curCount == 0 && b.cap.Load() >= b.minSize {
 		// If there was nothing in the slice already, and the slice didn't have size 0, we don't need to reset it
+		// Just set the updated exp value
+		b.exp.Store(now + ttl)
 		return nil
 	}
 
@@ -170,6 +178,10 @@ func (b *cacheBucket) resetIfNeeded(now int64, ttl int64) (swapped []uintptr) {
 	// Set length equal to capacity
 	b.elems = b.elems[0:cap(b.elems)]
 	b.cap.Store(int32(len(b.elems)))
+
+	// Update the exp value
+	b.exp.Store(now + ttl)
+
 	return curElems[0:curCount]
 }
 
@@ -180,7 +192,10 @@ func (b *cacheBucket) add(el uintptr) {
 	b.expandIfNeeded(pos)
 
 	// Store
+	// Use a RLock because we just need to make sure no one else is expanding the slice
+	b.mu.RLock()
 	b.elems[pos-1] = el
+	b.mu.RUnlock()
 }
 
 // Used internally to expand the capacity of the elems slice if needed.
